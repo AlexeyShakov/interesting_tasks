@@ -1,14 +1,3 @@
-import asyncio
-import aiohttp
-
-
-INTERVIEWED_URLS = []
-THREE_SERVICES = (
-    'http://service1/fillItems/',
-    'http://service2/scoreItems/',
-    'http://service3/logItems/',
-)
-
 """
 Асинхронно обрабатывает ~1M URL-ов с помощью aiohttp и asyncio.
 
@@ -43,6 +32,17 @@ THREE_SERVICES = (
 Неоптимально для продакшена, но подходит как «решение в лоб» для дальнейшего сравнения
 с очередями, пулами воркеров или стриминговой обработкой.
 """
+
+import asyncio
+import aiohttp
+
+
+INTERVIEWED_URLS = []
+THREE_SERVICES = (
+    'http://service1/fillItems/',
+    'http://service2/scoreItems/',
+    'http://service3/logItems/',
+)
 
 
 # TODO: добавить backoff
