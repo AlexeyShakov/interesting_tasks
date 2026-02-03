@@ -1,6 +1,50 @@
+"""
+Задание
+-------
+Есть очень большой набор входных URL (порядка 1_000_000). Для каждого URL нужно:
+
+1) Сделать HTTP GET-запрос к этому URL и получить список item_ids (list[int]) из JSON-ответа.
+2) Разбить обработку на батчи item_ids и для каждого батча параллельно вызвать 3 внешних сервиса:
+   - service1/fillItems
+   - service2/scoreItems
+   - service3/logItems
+   Каждый сервис получает batch item_ids через query params (например, повторяющийся параметр item_ids=...).
+   Из успешных ответов нужно собрать значения (например, цены) в список prices (list[float]).
+3) Выполнить дополнительную CPU-bound обработку полученных данных (например, преобразование prices -> list[int]
+   с тяжёлой логикой/агрегацией).
+4) Результаты CPU-обработки (list[int]) аккумулировать в общий результат (например, список/БД/файл).
+"""
+
+"""
+Идея решения
+
+Решение построено как многостадийный асинхронный пайплайн (streaming pipeline) на anyio:
+
+produce -> get_items -> interview_services -> work_cpu -> save
+
+- Между стадиями используются bounded in-memory streams (create_memory_object_stream) с max_buffer_size.
+  Это даёт backpressure: если downstream не успевает, upstream естественно замедляется, и память
+  остаётся ограниченной.
+- Для сетевого I/O используется один aiohttp.ClientSession с TCPConnector и лимитами соединений.
+- На стадии interview_services для каждого батча item_ids параллельно запускаются 3 запроса
+  (anyio.TaskGroup) — по одному на каждый сервис.
+- CPU-bound обработка вынесена в синхронную функцию и исполняется через to_thread.run_sync,
+  чтобы не блокировать event loop (при необходимости можно заменить на ProcessPool для использования
+  нескольких ядер).
+- Финальная стадия save аккумулирует результаты (в демо-версии — в list, но может быть заменена
+  на запись в БД/файл/очередь).
+
+Примечания
+----------
+- Ретраи/backoff с jitter и circuit breaker для сервисов можно добавить как улучшение устойчивости.
+- Логирование и метрики (timeouts, 5xx, decode errors, latency) стоит добавить для наблюдаемости.
+"""
+
 from anyio import create_task_group, create_memory_object_stream, run, to_thread
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 import aiohttp
+
+from wb_test.config import get_config
 
 
 INTERVIEWED_URLS = []
@@ -80,10 +124,6 @@ async def work_cpu(
             # Используем поток, чтобы не блокировать event-loop.
             # Если CPU-работа станет действительно тяжёлой, стоит подумать
             # о переходе на ProcessPool для использования нескольких ядер.
-            processed: list[int] = await to_thread.run_sync(
-                _cpu_heavy_transform,
-                prices,
-            )
             processed: list[int] = await to_thread.run_sync(
                 _cpu_heavy_transform,
                 prices,
@@ -214,13 +254,25 @@ async def main() -> None:
         limit=500,          # общее число одновременных соединений
         limit_per_host=100, # максимум на один (host, port)
     )
-
+    config = get_config()
     async with aiohttp.ClientSession(connector=connector) as session:
+        # TaskGroup — это "область жизни" для связанных задач:
+        # * все задачи стартуют вместе
+        # * выход из блока ждёт завершения всех задач
+        # * при ошибке одной задачи остальные корректно отменяются
         async with create_task_group() as tg:
+            # Пока читаем из списка нам не нужны воркеры, но если будем читать, где есть I/O, то воркеры понадобятся
             tg.start_soon(produce, produce_send_stream)
-            tg.start_soon(get_items, produce_rec_stream, items_send_stream, session)
-            tg.start_soon(interview_services, items_rec_stream, service_send_stream, session)
-            tg.start_soon(work_cpu, service_rec_stream, work_cpu_send_stream)
+            # stream.clone() — позволяет запустить несколько воркеров, которые конкурентно читают из одного
+            # канала, не теряя backpressure и не дублируя данные.
+            for _ in range(config.items_getter_workers):
+                tg.start_soon(get_items, produce_rec_stream.clone(), items_send_stream, session)
+            for _ in range(config.service_interviewers):
+                tg.start_soon(interview_services, items_rec_stream.clone(), service_send_stream, session)
+            for _ in range(config.cpu_workers):
+                tg.start_soon(work_cpu, service_rec_stream.clone(), work_cpu_send_stream)
+            # Пока мы просто пишем в список, нет смысла делать несколько воркеров. Но если мы будем сохранять куда-то в БД
+            # или отсылать в другой сервис, то несколько воркеров явно понадобятся
             tg.start_soon(save, work_cpu_rec_stream, accumulated_results)
 
     # Здесь accumulated_results уже заполнен
